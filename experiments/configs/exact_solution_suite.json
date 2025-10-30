@@ -1,0 +1,12 @@
+{
+  "configs": [
+    "experiments/configs/xx_closed.json",
+    "experiments/configs/xx_open.json",
+    "experiments/configs/xx_disordered_closed.json",
+    "experiments/configs/xx_disordered_open.json",
+    "experiments/configs/xxz_closed.json",
+    "experiments/configs/xxz_open.json",
+    "experiments/configs/xxz_stark_closed.json",
+    "experiments/configs/xxz_stark_open.json"
+  ]
+}

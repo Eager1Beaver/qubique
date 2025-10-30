@@ -1,0 +1,20 @@
+{
+  "model": {
+    "N": 6,
+    "J": 1.0,
+    "Delta": 0.0,
+    "boundary": "OBC",
+    "disorder": { "kind": "uniform", "strength": 0.8, "seed": 123 },
+    "potential": { "type": "none" }
+  },
+  "init": { "kind": "domain_wall" },
+  "time": { "t_max": 8.0, "steps": 200 },
+  "noise": { "dephasing_rate": 0.01, "relaxation_rate": 0.005, "thermal_pop": 0.02 },
+  "store_probabilities": true,
+  "store_prob_bases": ["Z","X","Y"],
+  "measure_pauli_strings": ["X0X1X2","X0Y1Y2","Y0X1Y2","Y0Y1X2"],
+  "entanglement_cut": 3,
+  "store_trajectory": "auto",
+  "observables": ["energy","magnetization_z","sz_sites"],
+  "random_seed": 104
+}

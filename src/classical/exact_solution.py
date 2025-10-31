@@ -5,7 +5,7 @@
 # Mermin (Pauli strings), Entanglement (SvN closed / log-negativity open).
 
 import argparse, json, os, csv, math, itertools, random
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import List, Optional, Literal, Dict
 
 import numpy as np
@@ -42,8 +42,8 @@ class ModelConfig:
     J: float = 1.0                      # XX coupling
     Delta: float = 0.0                  # ZZ coupling (XXZ)
     boundary: Literal["OBC", "PBC"] = "OBC"
-    disorder: DisorderConfig = DisorderConfig()
-    potential: PotentialConfig = PotentialConfig()
+    disorder: DisorderConfig = field(default_factory=DisorderConfig)
+    potential: PotentialConfig = field(default_factory=PotentialConfig)
 
 @dataclass
 class InitStateConfig:
@@ -58,10 +58,10 @@ class TimeConfig:
 
 @dataclass
 class RunConfig:
-    model: ModelConfig = ModelConfig()
-    init: InitStateConfig = InitStateConfig()
-    time: TimeConfig = TimeConfig()
-    noise: NoiseConfig = NoiseConfig()
+    model: ModelConfig = field(default_factory=ModelConfig)
+    init: InitStateConfig = field(default_factory=InitStateConfig)
+    time: TimeConfig = field(default_factory=TimeConfig)
+    noise: NoiseConfig = field(default_factory=NoiseConfig)
 
     # Storage / measurements for benchmarks
     store_probabilities: bool = False
@@ -265,18 +265,42 @@ def svn_bipartition_from_ket(psi: qt.Qobj, cut: int):
     return float(qt.entropy_vn(rhoA, base=2))
 
 def log_negativity_from_rho(rho: qt.Qobj, cut: int):
-    """Log-negativity across cut for mixed state: log2 || rho^{T_B} ||_1."""
-    N = len(rho.dims[0])
-    dims = [2]*N
-    # mask: 0 for A-subsys (no transpose), 1 for B-subsys (partial transpose on these)
+    """
+    Log-negativity across cut for a mixed state: log2 || rho^{T_B} ||_1.
+    Works across QuTiP versions that differ in partial_transpose signature.
+    """
+    # Ensure dims are set properly: [[2]*N, [2]*N]
+    if not rho.isoper:
+        raise ValueError("log_negativity_from_rho expects a density operator (Qobj.isoper == True).")
+
+    if rho.dims is None or len(rho.dims[0]) == 0:
+        # Infer N from matrix size as a fallback
+        N = int(round(np.log2(rho.shape[0])))
+        rho = rho.copy()
+        rho.dims = [[2]*N, [2]*N]
+    else:
+        N = len(rho.dims[0])
+
+    # Build mask: 0 for A (no transpose), 1 for B (partial transpose on these)
     A = set(range(cut))
     mask = [0 if i in A else 1 for i in range(N)]
-    rho_pt = qt.partial_transpose(rho, mask, dims=dims)
+
+    # Partial transpose (no 'dims' kwarg; relies on rho.dims)
+    try:
+        rho_pt = qt.partial_transpose(rho, mask)
+    except TypeError:
+        # Older/newer variants still use the same call signature without dims
+        rho_pt = qt.partial_transpose(rho, mask)
+
+    # Trace norm of rho^{T_B}
     evals = np.linalg.eigvals(rho_pt.full())
-    tr_norm = np.sum(np.abs(evals)).real
-    negativity = (tr_norm - 1.0) / 2.0
-    # log-neg base 2
-    return float(np.log2(2.0*negativity + 1.0))
+    tr_norm = float(np.sum(np.abs(evals)).real)
+
+    # Numerical guard: negativity >= 0
+    negativity = max((tr_norm - 1.0) / 2.0, 0.0)
+
+    # Log-negativity base 2
+    return float(np.log2(2.0 * negativity + 1.0))
 
 
 # =========================
@@ -328,16 +352,28 @@ def run(config: RunConfig):
         basis_bitstrings = [''.join(seq) for seq in itertools.product('01', repeat=N)]
 
     # evolve
+    # Decide if we need to store the full state trajectory:
+    need_states = True  # we need states for probs/entanglement/trajectory/pauli expectations
+    #opts = qt.Options(store_states=need_states, progress_bar=None)
+    opts: dict = {"store_states": need_states, "progress_bar": None}
+
     if closed:
-        result = qt.sesolve(H, psi0, ts, e_ops=e_ops if e_ops else None)
-        states = result.states  # list of kets
+        result = qt.sesolve(H, psi0, ts, e_ops=e_ops if e_ops else None, options=opts)
+        states = result.states  # list of kets (may be [])
         rho_final = None
     else:
         rho0 = psi0 * psi0.dag()
         rho0.dims = [[2]*config.model.N, [2]*config.model.N]
-        result = qt.mesolve(H, rho0, ts, c_ops=c_ops, e_ops=e_ops if e_ops else None)
-        states = result.states  # list of density matrices
-        rho_final = states[-1]
+        result = qt.mesolve(H, rho0, ts, c_ops=c_ops, e_ops=e_ops if e_ops else None, options=opts)
+        states = result.states  # list of density matrices (may be [])
+        rho_final = states[-1] if states else None
+
+    # Safety: ensure we actually have states (needed for outputs below)
+    if not states or len(states) == 0:
+        raise RuntimeError(
+            "QuTiP did not return states. Ensure Options(store_states=True) is set "
+            "and your QuTiP version supports it. (We set it above, so if this persists, "
+            "please check your QuTiP install.)")
 
     # Output paths
     run_id = config.run_id or f"exact_N{config.model.N}_{config.model.boundary}_{random.randrange(10**8):08d}"
@@ -520,14 +556,17 @@ def load_config(path: str) -> RunConfig:
     return rc
 
 def main():
-    ap = argparse.ArgumentParser(description="Exact small-chain evolution (QuTiP)")
+    '''ap = argparse.ArgumentParser(description="Exact small-chain evolution (QuTiP)")
     ap.add_argument("--config", type=str, required=True, help="Path to JSON config")
     ap.add_argument("--outdir", type=str, default=None, help="Override output directory")
-    args = ap.parse_args()
+    args = ap.parse_args()'''
 
-    rc = load_config(args.config)
+    # ..experiments/configs/xx_closed.json
+    rc = load_config('experiments/configs/xx_open.json')
+
+    '''rc = load_config(args.config)
     if args.outdir:
-        rc.outdir = args.outdir
+        rc.outdir = args.outdir'''
 
     info = run(rc)
     print(json.dumps(info, indent=2))

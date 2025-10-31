@@ -1,5 +1,5 @@
 # src/classical/run_exact_solution_suite.py
-import argparse, json, os, subprocess
+import argparse, json, subprocess
 
 def main():
     ap = argparse.ArgumentParser()

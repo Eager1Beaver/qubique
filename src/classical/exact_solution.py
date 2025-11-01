@@ -69,14 +69,14 @@ class RunConfig:
     measure_pauli_strings: List[str] = None     # e.g., ["X0X1X2","Z0Z1"]
     entanglement_cut: Optional[int] = None      # bipartition cut index
     store_trajectory: Literal["none", "auto", "ket", "rho"] = "none"
-    store_state: bool = False                   # keep final state (legacy; kept for compat)
+    store_state: bool = False                   # keep final state
 
     observables: List[str] = None               # ["energy","magnetization_z","sz_sites"]
     random_seed: Optional[int] = None
     pbc_wrap: bool = False
 
     # Output
-    outdir: str = "experiments/results"
+    outdir: str = "experiments/results/classical/exact_solution"
     run_id: Optional[str] = None
 
 
@@ -153,11 +153,10 @@ def build_initial_state(cfg: InitStateConfig, N: int):
         rng = random.Random(cfg.seed)
         bitstr = ''.join(rng.choice('01') for _ in range(N))
     else:
-        raise ValueError("Unknown init.kind")
+        raise ValueError("Unknown initial state kind")
 
     kets = {'0': qt.basis(2, 0), '1': qt.basis(2, 1)}
     psi0 = qt.tensor([kets[c] for c in bitstr])
-    # set composite dims for ptrace later
     psi0.dims = [[2]*N, [1]]
     return psi0, bitstr
 
@@ -181,12 +180,12 @@ def build_collapse_ops(noise: NoiseConfig, N: int):
                 c_ops.append(sqrt(noise.relaxation_rate * noise.thermal_pop) * embed(qt.sigmap(), i, N))
     return c_ops
 
-# ----- Pauli strings -----
+# Pauli strings
 PAULI_MAP = {"X": qt.sigmax(), "Y": qt.sigmay(), "Z": qt.sigmaz(), "I": qt.qeye(2)}
 
 def pauli_string_op(spec: str, N: int):
     """
-    spec like "X0Y1Y2", "Z0Z1", "X0". Missing sites => identity.
+    spec like "X0Y1Y2", "Z0Z1", "X0"
     """
     sites: Dict[int, qt.Qobj] = {}
     i = 0
@@ -209,7 +208,7 @@ def pauli_string_op(spec: str, N: int):
 def build_pauli_ops(strings: List[str], N: int):
     return {s: pauli_string_op(s, N) for s in strings}
 
-# ----- Observables -----
+# Observables
 def build_observables(N: int, want: List[str], H=None):
     sx, sy, sz, I = paulis()
     obs = {}
@@ -224,7 +223,7 @@ def build_observables(N: int, want: List[str], H=None):
             obs[f"sz_{i}"] = embed(sz, i, N)
     return obs
 
-# ----- Basis rotations -----
+# Basis rotations
 def hadamard():
     return qt.Qobj(np.array([[1, 1],[1, -1]], dtype=complex)) / np.sqrt(2)
 
@@ -254,7 +253,7 @@ def rotate_state_to_basis(state_like: qt.Qobj, base: str, N: int):
         out.dims = [[2]*N, [2]*N]
         return out
 
-# ----- Entanglement helpers -----
+# Entanglement helpers
 def svn_bipartition_from_ket(psi: qt.Qobj, cut: int):
     """von Neumann entropy across cut (0..cut-1 | cut..N-1) for pure state."""
     N = len(psi.dims[0])
@@ -267,9 +266,7 @@ def svn_bipartition_from_ket(psi: qt.Qobj, cut: int):
 def log_negativity_from_rho(rho: qt.Qobj, cut: int):
     """
     Log-negativity across cut for a mixed state: log2 || rho^{T_B} ||_1.
-    Works across QuTiP versions that differ in partial_transpose signature.
     """
-    # Ensure dims are set properly: [[2]*N, [2]*N]
     if not rho.isoper:
         raise ValueError("log_negativity_from_rho expects a density operator (Qobj.isoper == True).")
 
@@ -285,11 +282,9 @@ def log_negativity_from_rho(rho: qt.Qobj, cut: int):
     A = set(range(cut))
     mask = [0 if i in A else 1 for i in range(N)]
 
-    # Partial transpose (no 'dims' kwarg; relies on rho.dims)
     try:
         rho_pt = qt.partial_transpose(rho, mask)
     except TypeError:
-        # Older/newer variants still use the same call signature without dims
         rho_pt = qt.partial_transpose(rho, mask)
 
     # Trace norm of rho^{T_B}
@@ -304,7 +299,7 @@ def log_negativity_from_rho(rho: qt.Qobj, cut: int):
 
 
 # =========================
-# Core run
+# Run
 # =========================
 
 def run(config: RunConfig):
@@ -320,14 +315,14 @@ def run(config: RunConfig):
     H, realized_h = build_hamiltonian(config.model)
     psi0, bitstr0 = build_initial_state(config.init, config.model.N)
 
-    # time grid
+    # Time grid
     ts = np.linspace(0.0, config.time.t_max, config.time.steps + 1)
 
-    # open vs closed
+    # Open vs closed
     c_ops = build_collapse_ops(config.noise, config.model.N)
     closed = (len(c_ops) == 0)
 
-    # observables
+    # Observables
     want = config.observables or ["energy", "magnetization_z", "sz_sites"]
     obs_map = build_observables(config.model.N, want, H=H)
     e_ops = list(obs_map.values())
@@ -345,16 +340,14 @@ def run(config: RunConfig):
         if b not in ("Z","X","Y"):
             raise ValueError("store_prob_bases must be subset of ['Z','X','Y']")
 
-    # basis bitstrings
+    # Basis bitstrings
     basis_bitstrings = None
     if prob_on:
         N = config.model.N
         basis_bitstrings = [''.join(seq) for seq in itertools.product('01', repeat=N)]
 
-    # evolve
-    # Decide if we need to store the full state trajectory:
-    need_states = True  # we need states for probs/entanglement/trajectory/pauli expectations
-    #opts = qt.Options(store_states=need_states, progress_bar=None)
+    # Evolve
+    need_states = True  # need states for probs/entanglement/trajectory/pauli expectations
     opts: dict = {"store_states": need_states, "progress_bar": None}
 
     if closed:
@@ -368,19 +361,15 @@ def run(config: RunConfig):
         states = result.states  # list of density matrices (may be [])
         rho_final = states[-1] if states else None
 
-    # Safety: ensure we actually have states (needed for outputs below)
     if not states or len(states) == 0:
-        raise RuntimeError(
-            "QuTiP did not return states. Ensure Options(store_states=True) is set "
-            "and your QuTiP version supports it. (We set it above, so if this persists, "
-            "please check your QuTiP install.)")
-
+        raise RuntimeError("QuTiP did not return states. Ensure need_states = True is set")
+    
     # Output paths
     run_id = config.run_id or f"exact_N{config.model.N}_{config.model.boundary}_{random.randrange(10**8):08d}"
     outdir = os.path.join(config.outdir, run_id)
     os.makedirs(outdir, exist_ok=True)
 
-    # trajectory save mode
+    # Trajectory save mode
     traj_mode = config.store_trajectory
     if traj_mode == "auto":
         traj_mode = "rho" if not closed else "ket"
@@ -395,7 +384,7 @@ def run(config: RunConfig):
             np.savez(os.path.join(outdir, "trajectory_rho.npz"),
                      rhos=rho_stack, times=ts)
 
-    # final state save
+    # Final state save
     if config.store_state:
         if closed:
             psi_final = states[-1].full().reshape(-1)
@@ -404,10 +393,10 @@ def run(config: RunConfig):
             np.savez(os.path.join(outdir, "state_final.npz"), rho=rho_final.full())
 
     # =========================
-    # CSV: build headers once
+    # CSV: build headers
     # =========================
     headers = ["t"]
-    headers.extend(obs_names)                          # expectations of observables
+    headers.extend(obs_names) # expectations of observables
     if pauli_ops:
         headers.extend([f"exp_{s}" for s in pauli_ops.keys()])
     if config.entanglement_cut is not None:
@@ -447,7 +436,6 @@ def run(config: RunConfig):
                 val = svn_bipartition_from_ket(psi, cut)
             else:
                 rho = states[k]
-                # ensure dims set
                 rho.dims = [[2]*config.model.N, [2]*config.model.N]
                 val = log_negativity_from_rho(rho, cut)
             row.append(float(val))
@@ -455,7 +443,7 @@ def run(config: RunConfig):
         # Probabilities in requested bases
         if prob_on and basis_bitstrings:
             if closed:
-                psi_z = states[k]  # already in Z basis
+                psi_z = states[k]
                 for base in prob_bases:
                     if base == "Z":
                         probs = np.abs(psi_z.full())**2
@@ -478,14 +466,14 @@ def run(config: RunConfig):
 
         rows.append(row)
 
-    # write CSV
+    # Write CSV
     csv_path = os.path.join(outdir, "timeseries.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(headers)
         writer.writerows(rows)
 
-    # manifest
+    # Manifest
     manifest = {
         "run_id": run_id,
         "solver": "sesolve" if closed else "mesolve",

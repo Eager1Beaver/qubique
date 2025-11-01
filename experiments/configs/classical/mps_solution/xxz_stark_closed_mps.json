@@ -1,0 +1,41 @@
+{
+  "backend": "mps",
+  "model": {
+    "N": 64,
+    "J": 1.0,
+    "Delta": 0.7,
+    "boundary": "OBC",
+    "disorder": {
+      "kind": "none"
+    },
+    "potential": {
+      "type": "linear",
+      "slope": 0.5
+    }
+  },
+  "init": {
+    "kind": "domain_wall"
+  },
+  "time": {
+    "t_max": 40.0,
+    "steps": 800
+  },
+  "noise": {
+    "dephasing_rate": 0.0,
+    "relaxation_rate": 0.0
+  },
+  "observables": [
+    "energy",
+    "magnetization_z",
+    "sz_sites"
+  ],
+  "entanglement_cut": 32,
+  "mps": {
+    "method": "TEBD2",
+    "bond_dim_max": 384,
+    "svd_trunc_tol": 1e-09,
+    "conserve": "Sz",
+    "two_site": true
+  },
+  "outdir": "experiments/xxz_stark_closed_mps"
+}

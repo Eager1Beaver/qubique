@@ -1,0 +1,40 @@
+{
+  "backend": "mps",
+  "model": {
+    "N": 48,
+    "J": 1.0,
+    "Delta": 0.0,
+    "boundary": "OBC",
+    "disorder": {
+      "kind": "none"
+    },
+    "potential": {
+      "type": "none"
+    }
+  },
+  "init": {
+    "kind": "neel"
+  },
+  "time": {
+    "t_max": 40.0,
+    "steps": 800
+  },
+  "noise": {
+    "dephasing_rate": 0.0,
+    "relaxation_rate": 0.0
+  },
+  "observables": [
+    "energy",
+    "magnetization_z",
+    "sz_sites"
+  ],
+  "entanglement_cut": 24,
+  "mps": {
+    "method": "TEBD2",
+    "bond_dim_max": 256,
+    "svd_trunc_tol": 1e-09,
+    "conserve": "Sz",
+    "two_site": true
+  },
+  "outdir": "experiments/xx_closed_mps"
+}

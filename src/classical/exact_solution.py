@@ -556,20 +556,17 @@ def load_config(path: str) -> RunConfig:
     return rc
 
 def main():
-    '''ap = argparse.ArgumentParser(description="Exact small-chain evolution (QuTiP)")
+    ap = argparse.ArgumentParser(description="Exact small-chain evolution (QuTiP)")
     ap.add_argument("--config", type=str, required=True, help="Path to JSON config")
     ap.add_argument("--outdir", type=str, default=None, help="Override output directory")
-    args = ap.parse_args()'''
+    args = ap.parse_args()
 
-    # ..experiments/configs/xx_closed.json
-    rc = load_config('experiments/configs/xx_open.json')
-
-    '''rc = load_config(args.config)
+    rc = load_config(args.config)
     if args.outdir:
-        rc.outdir = args.outdir'''
+        rc.outdir = args.outdir
 
     info = run(rc)
-    print(json.dumps(info, indent=2))
+    print(f'Experiment ran successfully\n{json.dumps(info, indent=2)}')
 
 if __name__ == "__main__":
     main()

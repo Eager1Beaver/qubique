@@ -16,7 +16,7 @@ except ImportError as e:
 
 
 # =========================
-# Config schema
+# Config
 # =========================
 
 @dataclass

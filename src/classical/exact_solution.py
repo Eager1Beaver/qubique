@@ -9,6 +9,7 @@ from dataclasses import dataclass, asdict, field
 from typing import List, Optional, Literal, Dict
 
 import numpy as np
+
 try:
     import qutip as qt
 except ImportError as e:
@@ -81,7 +82,7 @@ class RunConfig:
 
 
 # =========================
-# Operators & builders
+# Operators
 # =========================
 
 def paulis():
@@ -141,7 +142,7 @@ def build_initial_state(cfg: InitStateConfig, N: int):
     |0> := |↑z>, |1> := |↓z>. Returns (psi0, bitstr).
     """
     if cfg.kind == "neel":
-        bitstr = ''.join('10'[(i % 2)] for i in range(N))  # "1010..."
+        bitstr = ''.join('10'[(i % 2)] for i in range(N)) # "1010..."
     elif cfg.kind == "domain_wall":
         half = N // 2
         bitstr = '1'*half + '0'*(N-half)
@@ -210,7 +211,7 @@ def build_pauli_ops(strings: List[str], N: int):
 
 # Observables
 def build_observables(N: int, want: List[str], H=None):
-    sx, sy, sz, I = paulis()
+    _, _, sz, _ = paulis() # sx, sy, sz, I
     obs = {}
     if "energy" in want:
         if H is None:

@@ -1,63 +1,36 @@
-# src/mps/mps_solution.py
-# TEBD backend for XX/XXZ (OBC) with optional dense readout at small N to mirror the exact backend.
-# Features:
-# - Matches QuTiP "Pauli" convention by rescaling couplings: Jxx=4J, Jz=4Δ, hz=2h
-# - Observables: energy, magnetization_z (Pauli norm), sz_i, SvN_cut (base-2)
-# - Loschmidt echo (pure state): |<psi(0)|psi(t)>|^2
-# - Pauli string expectations: exp_<pattern> (e.g., exp_X0X1X2, exp_Z0Z5)
-# - Full probabilities in Z/X/Y bases at small N: pZ_<bitstring>, pX_*, pY_*
-#
-# Dense readout is enabled only when `dense_readout` is true AND N <= dense_readout_N_max.
-# For larger N, TEBD still runs; strings & probabilities are skipped to avoid 2^N blow-up.
-#
-# CLI:
-#   python -m src.mps.mps_solution --config path/to/config.json [--outdir OUT]
-#
-# JSON fields (superset of exact backend):
-#   backend: "mps"
-#   model: { N, J, Delta, boundary, disorder, potential }
-#   init:  { kind, basis_string }
-#   time:  { t_max, steps }
-#   noise: (ignored here; closed system only)
-#   observables: ["energy","magnetization_z","sz_sites"]
-#   entanglement_cut: int | null
-#   measure_pauli_strings: ["X0X1", "Z0Z2Z3", ...]
-#   store_probabilities: true|false
-#   store_prob_bases: ["Z","X","Y"]
-#   store_loschmidt: true|false
-#   dense_readout: true|false
-#   dense_readout_N_max: int (default 12)
-#   mps: { method, bond_dim_max, svd_trunc_tol, conserve, two_site }
-#
-import argparse, json, os, csv, math, itertools, warnings
+# src/classical/mps_solution.py
+# MPS/TEBD backend for 1D XX/XXZ chains (OBC) using TeNPy.
+#   - Matches exact (Pauli) convention via rescale: Jxx=4J, Jz=4Δ, hz=2h
+#   - Closed system TEBD + (optional) open-system quantum trajectories (MCWF)
+#   - Dense readout path at small N: pZ/pX/pY_*, exp_* (Pauli strings), Loschmidt
+
+import argparse, json, os, csv, math, itertools
 from dataclasses import dataclass, asdict, field
 from typing import List, Optional, Literal, Dict, Any
 
 import numpy as np
 
-# TeNPy imports
 try:
     from tenpy.models.xxz_chain import XXZChain
     from tenpy.networks.mps import MPS
     from tenpy.algorithms import tebd
+    from tenpy.algorithms.exact_diag import ExactDiag
 except Exception as e:
-    raise SystemExit("Please install TeNPy first: pip install tenpy\n"
-                     "Docs: https://tenpy.readthedocs.io/") from e
-
+    raise SystemExit("Please install TeNPy first: pip install tenpy-physics") from e
 
 # -------------------------
 # Config
 # -------------------------
 @dataclass
 class NoiseConfig:
-    dephasing_rate: float = 0.0
-    relaxation_rate: float = 0.0
-    thermal_pop: Optional[float] = None
+    dephasing_rate: float = 0.0         # γφ
+    relaxation_rate: float = 0.0        # γ↓  (|1>→|0>)
+    thermal_pop: Optional[float] = 0.0  # γ↑  (|0>→|1>), # excited-state pop for thermal (None => 0)
 
 @dataclass
 class DisorderConfig:
     kind: Literal["none", "uniform", "normal"] = "none"
-    strength: float = 0.0
+    strength: float = 0.0               # half-width (uniform) or std (normal)
     seed: Optional[int] = None
 
 @dataclass
@@ -68,8 +41,8 @@ class PotentialConfig:
 @dataclass
 class ModelConfig:
     N: int = 6
-    J: float = 1.0        # Pauli convention
-    Delta: float = 0.0    # Pauli convention
+    J: float = 1.0                      # XX coupling
+    Delta: float = 0.0                  # ZZ coupling (XXZ)
     boundary: Literal["OBC", "PBC"] = "OBC"
     disorder: DisorderConfig = field(default_factory=DisorderConfig)
     potential: PotentialConfig = field(default_factory=PotentialConfig)
@@ -82,7 +55,12 @@ class InitStateConfig:
 @dataclass
 class TimeConfig:
     t_max: float = 8.0
-    steps: int = 800
+    steps: int = 200
+
+@dataclass
+class TrajectoriesConfig:
+    n_traj: int = 1
+    seed: Optional[int] = None
 
 @dataclass
 class MPSConfig:
@@ -91,6 +69,7 @@ class MPSConfig:
     svd_trunc_tol: float = 1e-9
     conserve: Literal["Sz", "None"] = "Sz"
     two_site: bool = True
+    trajectories: TrajectoriesConfig = field(default_factory=TrajectoriesConfig)
 
 @dataclass
 class RunConfig:
@@ -99,7 +78,11 @@ class RunConfig:
     init: InitStateConfig = field(default_factory=InitStateConfig)
     time: TimeConfig = field(default_factory=TimeConfig)
     noise: NoiseConfig = field(default_factory=NoiseConfig)
+
     observables: List[str] = field(default_factory=lambda: ["energy", "magnetization_z", "sz_sites"])
+    random_seed: Optional[int] = None
+    pbc_wrap: bool = False
+
     measure_pauli_strings: List[str] = field(default_factory=list)
     entanglement_cut: Optional[int] = None
     store_probabilities: bool = False
@@ -107,16 +90,22 @@ class RunConfig:
     store_loschmidt: bool = True
     dense_readout: bool = True
     dense_readout_N_max: int = 12
-    random_seed: Optional[int] = None
-    pbc_wrap: bool = False
-    outdir: str = "experiments/results/classical/results_mps"
-    run_id: Optional[str] = None
-    mps: MPSConfig = field(default_factory=MPSConfig)
 
+    outdir: str = "experiments/results_mps"
+    run_id: Optional[str] = None
+
+    mps: MPSConfig = field(default_factory=MPSConfig)
 
 # -------------------------
 # Utilities
 # -------------------------
+_SIGMA_X = np.array([[0, 1],[1, 0]], dtype=complex)
+_SIGMA_Y = np.array([[0, -1j],[1j, 0]], dtype=complex)
+_SIGMA_Z = np.array([[1, 0],[0, -1]], dtype=complex)
+_I2      = np.eye(2, dtype=complex)
+_H       = np.array([[1, 1],[1, -1]], dtype=complex) / np.sqrt(2)
+_SDG     = np.array([[1, 0],[0, -1j]], dtype=complex) 
+
 def _ensure_dir(d: str):
     os.makedirs(d, exist_ok=True)
 
@@ -142,10 +131,11 @@ def _build_hz_array(cfg: ModelConfig) -> np.ndarray:
     return h
 
 def _basis_string_from_init(init: InitStateConfig, N: int, seed: Optional[int]) -> str:
-    # Match exact backend convention:
-    #   neel starts with '1' at site 0: "1010..." (|1>=down/−1)
+    """
+    |0> := |↑z>, |1> := |↓z>.
+    """
     if init.kind == "neel":
-        return "".join("10"[i % 2] for i in range(N))
+        return "".join("10"[i % 2] for i in range(N)) # "1010..."
     elif init.kind == "domain_wall":
         return "1"*(N//2) + "0"*(N - N//2)
     elif init.kind == "product_random_z":
@@ -156,16 +146,13 @@ def _basis_string_from_init(init: InitStateConfig, N: int, seed: Optional[int]) 
             raise ValueError("init.basis_string must be a length-N string of 0/1")
         return init.basis_string
     else:
-        raise ValueError("Unknown init.kind")
+        raise ValueError("Unknown initial state kind")
 
 def _product_state_list(basis_string: str) -> List[str]:
-    # Map '0' -> 'up' (Z=+1), '1' -> 'down' (Z=-1) as in exact backend
+    # '0' -> 'up' (Z=+1), '1' -> 'down' (Z=-1)
     return ['up' if ch == '0' else 'down' for ch in basis_string]
 
 def _build_model_and_state(cfg: RunConfig):
-    if cfg.noise.dephasing_rate > 0.0 or cfg.noise.relaxation_rate > 0.0 or (cfg.noise.thermal_pop not in (None, 0.0)):
-        raise NotImplementedError("Open-system (Lindblad) is not yet implemented for MPS. Use exact backend for small-N open-system validation.")
-
     N = cfg.model.N
     if cfg.model.boundary != "OBC":
         raise ValueError("XXZChain backend currently supports OBC only (bc_MPS='finite').")
@@ -173,6 +160,15 @@ def _build_model_and_state(cfg: RunConfig):
     # Rescale to match Pauli convention of exact backend
     hz_exact = _build_hz_array(cfg.model)
     hz = 2.0 * hz_exact
+
+    # Add non-Hermitian effective field from relaxation/excitation jumps: +i*(γ↓−γ↑)/2 * Sz
+    gam_d = float(cfg.noise.relaxation_rate or 0.0)
+    gam_u = float(cfg.noise.thermal_pop or 0.0)
+    if np.any(hz) or (gam_d != 0.0 or gam_u != 0.0):
+        hz = hz.astype(complex)
+    if (gam_d != 0.0 or gam_u != 0.0):
+        hz = hz + 1j * 0.5 * (gam_d - gam_u)
+
     model_params = dict(
         L=N,
         Jxx=4.0 * float(cfg.model.J),
@@ -204,58 +200,36 @@ def _tebd_engine(M, psi, cfg: RunConfig):
     try:
         eng = tebd.TEBDEngine(psi, M, tebd_params)
     except Exception:
-        # Fallback for older signatures
         legacy = dict(tebd_params)
         legacy["delta_t"] = legacy.pop("dt")
         legacy.pop("N_steps", None)
         eng = tebd.TEBDEngine(psi, M, legacy)
     return eng, dt
 
-# To dense (for small N)
-def _state_to_dense(psi) -> np.ndarray:
-    """
-    Dense |psi> as a complex vector (length 2**N), site-0 as MSB.
-    Uses TeNPy's public API: psi.get_theta(0, L) -> npc.Array with legs
-    ['vL', 'p0', ..., 'p{N-1}', 'vR'] for finite MPS; boundary legs have dim=1.
-    """
+# To dense (small N)
+def _state_to_dense(psi: MPS) -> np.ndarray:
+    """Dense |psi> as a complex vector (length 2**N), site-0 as MSB."""
     try:
-        theta = psi.get_theta(0, psi.L)        # npc.Array
+        theta = psi.get_theta(0, psi.L)  # npc.Array
     except Exception as e:
-        # Fallback: try the ED helper if present in your version
         try:
-            from tenpy.algorithms.exact_diag import ExactDiag
-            # Some TeNPy versions require an instance; if unavailable, re-raise.
-            dense = ExactDiag.mps_to_full(psi)  # may exist in your install
+            dense = ExactDiag.mps_to_full(psi)
             return np.asarray(dense, dtype=complex).reshape(-1)
         except Exception:
-            raise RuntimeError("Cannot densify MPS: get_theta failed and no ED fallback.") from e
-
-    # Convert npc.Array -> ndarray; squeeze 1x boundary legs; flatten with C-order.
+            raise RuntimeError("Cannot densify MPS: get_theta failed.") from e
     arr = theta.to_ndarray() if hasattr(theta, "to_ndarray") else np.asarray(theta)
     arr = np.squeeze(arr)
     return arr.reshape(-1).astype(complex)
 
 def _apply_local_ops_to_state(vec: np.ndarray, ops: List[np.ndarray]) -> np.ndarray:
-    """Apply per-site 2x2 ops to |psi> without building a 2^N x 2^N matrix.
-    vec: shape (2**N,)
-    ops: list of length N with 2x2 matrices or None for identity.
-    """
     N = len(ops)
     psi = vec.reshape([2]*N)
     for i, op in enumerate(ops):
         if op is None:
             continue
         psi = np.tensordot(op, psi, axes=(1, i))
-        psi = np.moveaxis(psi, 0, i)  # restore site order
+        psi = np.moveaxis(psi, 0, i)
     return psi.reshape(-1)
-
-# Pauli and single-qubit unitaries
-_SIGMA_X = np.array([[0, 1],[1, 0]], dtype=complex)
-_SIGMA_Y = np.array([[0, -1j],[1j, 0]], dtype=complex)
-_SIGMA_Z = np.array([[1, 0],[0, -1]], dtype=complex)
-_I2      = np.eye(2, dtype=complex)
-_H       = np.array([[1, 1],[1, -1]], dtype=complex) / np.sqrt(2)
-_SDG     = np.array([[1, 0],[0, -1j]], dtype=complex)  # S^\dagger
 
 def _unitary_for_basis(base: str) -> np.ndarray:
     b = base.upper()
@@ -269,7 +243,6 @@ def _unitary_for_basis(base: str) -> np.ndarray:
         raise ValueError("Unknown basis: " + base)
 
 def _bitstrings_lex(N: int):
-    # msb = site 0 (leftmost), matches QuTiP default ordering
     for bits in itertools.product("01", repeat=N):
         yield "".join(bits)
 
@@ -278,7 +251,6 @@ def _prob_columns_for_basis(N: int, base: str):
     return [prefix + b for b in _bitstrings_lex(N)]
 
 def _measure_probabilities_dense(vec: np.ndarray, bases: List[str]) -> Dict[str, float]:
-    """Return probabilities for each basis as {col_name: prob}."""
     N = int(round(np.log2(vec.size)))
     out: Dict[str, float] = {}
     psi0 = vec
@@ -287,19 +259,14 @@ def _measure_probabilities_dense(vec: np.ndarray, bases: List[str]) -> Dict[str,
         ops = [U] * N
         rotated = _apply_local_ops_to_state(psi0, ops)
         probs = np.abs(rotated)**2
-        # normalize (guard against tiny round-off)
         s = float(np.sum(probs))
-        if s <= 0.0:
-            probs = np.zeros_like(probs)
-        else:
-            probs = probs / s
+        probs = probs / s if s > 0.0 else probs
         cols = _prob_columns_for_basis(N, base)
         for name, p in zip(cols, probs):
             out[name] = float(np.real(p))
     return out
 
 def _parse_pauli_string_token(token: str):
-    # e.g., "X0", "Z12"
     if len(token) < 2:
         raise ValueError(f"Bad pauli token: {token}")
     op = token[0].upper()
@@ -309,9 +276,7 @@ def _parse_pauli_string_token(token: str):
     return op, idx
 
 def _ops_list_for_pauli_pattern(N: int, pattern: str) -> List[np.ndarray]:
-    """pattern like 'X0X1X2' or 'Z0Z5'."""
     ops = [None] * N
-    # break into tokens op+index
     i = 0
     while i < len(pattern):
         op = pattern[i].upper()
@@ -325,40 +290,31 @@ def _ops_list_for_pauli_pattern(N: int, pattern: str) -> List[np.ndarray]:
     return ops
 
 def _measure_pauli_strings_dense(vec: np.ndarray, patterns: List[str]) -> Dict[str, float]:
-    N = int(round(np.log2(vec.size)))
     out: Dict[str, float] = {}
     for pat in patterns:
-        ops = _ops_list_for_pauli_pattern(N, pat)
+        ops = _ops_list_for_pauli_pattern(int(round(np.log2(vec.size))), pat)
         Opsi = _apply_local_ops_to_state(vec, ops)
         exp = np.vdot(vec, Opsi)  # <psi|O|psi>
         out["exp_" + pat] = float(np.real(exp))
     return out
 
 def _compute_entropy_at_cut(psi: MPS, cut: int) -> float:
-    """Return von Neumann entropy across cut (A: [0..cut-1] | B: [cut..N-1]) in bits.
-    cut in [1..N-1]."""
     if cut is None:
         return None
-    S_e = psi.entanglement_entropy()  # list per bond in nats
+    S_e = psi.entanglement_entropy()  # per bond, in nats
     b = int(cut) - 1
     if b < 0 or b >= len(S_e):
         raise ValueError(f"entanglement_cut={cut} is out of range for N={psi.L}. Use 1..{psi.L-1}.")
     return float(S_e[b] / math.log(2.0))
 
 def _measure_all_basic(M, psi, want: List[str]) -> Dict[str, float]:
-    """Compute basic observables that don't require dense conversion."""
     out: Dict[str, float] = {}
-
-    # Energy: sum of local bond energies (nearest-neighbor model)
     try:
         E = float(np.real(np.sum(M.bond_energies(psi))))
     except Exception:
-        # fallback: MPO self-evaluation for finite chains
         E = float(np.real(M.H_MPO.expectation_value_finite(psi)))
     if "energy" in want:
         out["energy"] = E
-
-    # Pauli-Z normalization: 2*<Sz>
     need_sz = ("magnetization_z" in want) or ("sz_sites" in want)
     if need_sz:
         sz_vals = 2.0 * np.asarray(psi.expectation_value("Sz"), dtype=float)
@@ -367,130 +323,212 @@ def _measure_all_basic(M, psi, want: List[str]) -> Dict[str, float]:
         if "sz_sites" in want:
             for i, v in enumerate(sz_vals):
                 out[f"sz_{i}"] = float(v)
-
     return out
 
+# Open-system (trajectories) helpers
+def _compute_jump_rates_per_site(psi, gamma_phi: float, gamma_down: float, gamma_up: float):
+    """Compute per-site jump rates using current populations."""
+    N = psi.L
+    sz_vals = 2.0 * np.asarray(psi.expectation_value("Sz"), dtype=float)
+    pop1 = (1.0 - sz_vals) * 0.5  # |1>
+    pop0 = (1.0 + sz_vals) * 0.5  # |0>
+    lam_phi  = np.full(N, float(gamma_phi), dtype=float)
+    lam_down = np.asarray(gamma_down * pop1, dtype=float)  # 1->0 (σ-), TeNPy operator 'Sp'
+    lam_up   = np.asarray(gamma_up * pop0, dtype=float)    # 0->1 (σ+), TeNPy operator 'Sm'
+    return lam_phi, lam_down, lam_up
+
+def _apply_local_jump(psi, i: int, kind: str):
+    """Apply local jump by name using site ops (npc.Array). kind in {'Z','Sp','Sm'}.
+    'Z'  -> σz (use 'Sigmaz' if present; else 2*Sz)
+    'Sp' -> TeNPy 'Sp' (matrix [[0,1],[0,0]]) == σ-
+    'Sm' -> TeNPy 'Sm' (matrix [[0,0],[1,0]]) == σ+
+    """
+    site = psi.sites[i]
+    if kind == 'Z':
+        try:
+            op = site.get_op('Sigmaz')
+        except Exception:
+            op = 2.0 * site.get_op('Sz')
+    elif kind == 'Sp':
+        op = site.get_op('Sp')
+    elif kind == 'Sm':
+        op = site.get_op('Sm')
+    else:
+        raise ValueError(f"Unknown jump kind: {kind}")
+    psi.apply_local_op(i, op)
+    try:
+        psi.normalize()
+    except Exception:
+        pass
+
+def _sample_and_apply_jumps(psi, dt: float, gamma_phi: float, gamma_down: float, gamma_up: float, rng: np.random.Generator):
+    if gamma_phi==0.0 and gamma_down==0.0 and gamma_up==0.0:
+        return 0
+    lam_phi, lam_down, lam_up = _compute_jump_rates_per_site(psi, gamma_phi, gamma_down, gamma_up)
+    N = psi.L
+    jumps = 0
+    for i in range(N):
+        lam_tot = lam_phi[i] + lam_down[i] + lam_up[i]
+        p_tot = lam_tot * dt
+        if p_tot <= 0.0:
+            continue
+        if rng.random() < p_tot:
+            r = rng.random() * lam_tot
+            if r < lam_phi[i]:
+                _apply_local_jump(psi, i, 'Z')
+            elif r < lam_phi[i] + lam_down[i]:
+                _apply_local_jump(psi, i, 'Sp')   # 1->0 (σ-)
+            else:
+                _apply_local_jump(psi, i, 'Sm')   # 0->1 (σ+)
+            jumps += 1
+    return jumps
 
 def run(cfg: RunConfig) -> Dict[str, Any]:
     if cfg.pbc_wrap:
         cfg.model.boundary = "PBC"
 
-    if cfg.random_seed is not None:
-        np.random.seed(cfg.random_seed)
+    n_traj = int(getattr(cfg.mps, "trajectories", TrajectoriesConfig()).n_traj if hasattr(cfg.mps, "trajectories") else 1)
+    seed   = getattr(cfg.mps.trajectories, "seed", None) if hasattr(cfg.mps, "trajectories") else None
+    rng_master = np.random.default_rng(seed)
 
-    # Build model & engine
-    M, psi, bitstr0 = _build_model_and_state(cfg)
-    eng, dt = _tebd_engine(M, psi, cfg)
+    gamma_phi  = float(cfg.noise.dephasing_rate or 0.0)
+    gamma_down = float(cfg.noise.relaxation_rate or 0.0)
+    gamma_up   = float(cfg.noise.thermal_pop or 0.0)
 
-    # Dense readout check
-    do_dense = bool(cfg.dense_readout and (cfg.model.N <= int(cfg.dense_readout_N_max)))
-    if (cfg.store_probabilities or cfg.measure_pauli_strings) and not do_dense:
-        warnings.warn("Skipping probabilities/pauli-strings: set dense_readout=true and N<=dense_readout_N_max.")
+    M_proto, psi_proto, bitstr0 = _build_model_and_state(cfg)
+    eng_proto, dt = _tebd_engine(M_proto, psi_proto, cfg)
 
-    # Time grid
     steps = int(cfg.time.steps)
     t_max = float(cfg.time.t_max)
     ts = np.linspace(0.0, t_max, steps + 1)
 
-    # CSV headers
     obs_names: List[str] = []
-    if "energy" in cfg.observables:            obs_names.append("energy")
-    if "magnetization_z" in cfg.observables:   obs_names.append("magnetization_z")
+    if "energy" in cfg.observables: obs_names.append("energy")
+    if "magnetization_z" in cfg.observables: obs_names.append("magnetization_z")
     if "sz_sites" in cfg.observables:
         obs_names.extend([f"sz_{i}" for i in range(cfg.model.N)])
     headers = ["t"] + obs_names
 
+    do_dense = bool(cfg.dense_readout and (cfg.model.N <= int(cfg.dense_readout_N_max)))
     if cfg.store_loschmidt:
         headers.extend(["overlap_re", "overlap_im", "loschmidt"])
-
     if cfg.entanglement_cut is not None:
         headers.append("SvN_cut")
-
-    # dense-derived columns
     prob_cols = []
     if do_dense and cfg.store_probabilities:
         for b in cfg.store_prob_bases:
             prob_cols.extend(_prob_columns_for_basis(cfg.model.N, b))
         headers.extend(prob_cols)
-
     exp_cols = []
     if do_dense and cfg.measure_pauli_strings:
         exp_cols = [f"exp_{pat}" for pat in cfg.measure_pauli_strings]
         headers.extend(exp_cols)
 
-    # Prepare initial dense state if needed (for loschmidt and dense readouts)
-    psi0_dense = _state_to_dense(psi) if (cfg.store_loschmidt or do_dense) else None
+    K = steps + 1
+    acc = {name: np.zeros(K, dtype=float) for name in headers if name != "t"}
+    cnt = {name: np.zeros(K, dtype=float) for name in headers if name != "t"}
 
-    # t=0
-    rows: List[List[float]] = []
-    meas0 = _measure_all_basic(M, psi, cfg.observables)
-    row0 = [0.0] + [meas0.get(name, float('nan')) for name in obs_names]
+    for _ in range(n_traj):
+        M, psi, _ = _build_model_and_state(cfg)
+        eng, dt = _tebd_engine(M, psi, cfg)
+        rng = np.random.default_rng(rng_master.integers(0, 2**31 - 1))
+        psi0_dense = _state_to_dense(psi) if (cfg.store_loschmidt or do_dense) else None
 
-    # Loschmidt at t=0
-    if cfg.store_loschmidt:
-        ov = complex(1.0+0j) if psi0_dense is None else np.vdot(psi0_dense, psi0_dense)
-        row0.extend([float(np.real(ov)), float(np.imag(ov)), float(np.abs(ov)**2)])
-
-    # Entropy
-    if cfg.entanglement_cut is not None:
-        row0.append(_compute_entropy_at_cut(psi, cfg.entanglement_cut))
-
-    # Dense readouts
-    if do_dense:
-        vec = psi0_dense
-        if cfg.store_probabilities:
-            probs0 = _measure_probabilities_dense(vec, cfg.store_prob_bases)
-            row0.extend([probs0.get(c, 0.0) for c in prob_cols])
-        if cfg.measure_pauli_strings:
-            exps0 = _measure_pauli_strings_dense(vec, cfg.measure_pauli_strings)
-            row0.extend([exps0.get(c, float('nan')) for c in exp_cols])
-
-    rows.append(row0)
-
-    # Subsequent times
-    t = 0.0
-    for k in range(steps):
-        eng.run()   # step by dt
-        t += dt
-
-        meas = _measure_all_basic(M, psi, cfg.observables)
-        row = [float(t)] + [meas.get(name, float('nan')) for name in obs_names]
+        # t=0
+        k = 0
+        meas0 = _measure_all_basic(M, psi, cfg.observables)
+        for name in obs_names:
+            if name in meas0:
+                acc[name][k] += meas0[name]; cnt[name][k] += 1.0
 
         if cfg.store_loschmidt:
             if psi0_dense is None:
-                row.extend([float('nan'), float('nan'), float('nan')])
+                ov_re = ov_im = le = float('nan')
             else:
-                vec_t = _state_to_dense(psi)
-                ov = np.vdot(psi0_dense, vec_t)
-                row.extend([float(np.real(ov)), float(np.imag(ov)), float(np.abs(ov)**2)])
+                ov = np.vdot(psi0_dense, psi0_dense)
+                ov_re, ov_im, le = float(np.real(ov)), float(np.imag(ov)), float(np.abs(ov)**2)
+            for nm, val in zip(["overlap_re","overlap_im","loschmidt"], [ov_re, ov_im, le]):
+                if not np.isnan(val):
+                    acc[nm][k] += val; cnt[nm][k] += 1.0
 
         if cfg.entanglement_cut is not None:
-            row.append(_compute_entropy_at_cut(psi, cfg.entanglement_cut))
+            Sv = _compute_entropy_at_cut(psi, cfg.entanglement_cut)
+            acc["SvN_cut"][k] += Sv; cnt["SvN_cut"][k] += 1.0
 
         if do_dense:
-            vec = _state_to_dense(psi)
+            vec = psi0_dense
             if cfg.store_probabilities:
-                probs = _measure_probabilities_dense(vec, cfg.store_prob_bases)
-                row.extend([probs.get(c, 0.0) for c in prob_cols])
+                probs0 = _measure_probabilities_dense(vec, cfg.store_prob_bases)
+                for c in prob_cols:
+                    acc[c][k] += probs0.get(c, 0.0); cnt[c][k] += 1.0
             if cfg.measure_pauli_strings:
-                exps = _measure_pauli_strings_dense(vec, cfg.measure_pauli_strings)
-                row.extend([exps.get(c, float('nan')) for c in exp_cols])
+                exps0 = _measure_pauli_strings_dense(vec, cfg.measure_pauli_strings)
+                for c in exp_cols:
+                    val = exps0.get(c, float('nan'))
+                    if not np.isnan(val):
+                        acc[c][k] += val; cnt[c][k] += 1.0
 
-        rows.append(row)
+        # Steps
+        t = 0.0
+        for step in range(steps):
+            eng.run()
+            t += dt
+            if (gamma_phi!=0.0) or (gamma_down!=0.0) or (gamma_up!=0.0):
+                _sample_and_apply_jumps(psi, dt, gamma_phi, gamma_down, gamma_up, rng)
 
-    # Output
+            k = step + 1
+            meas = _measure_all_basic(M, psi, cfg.observables)
+            for name in obs_names:
+                if name in meas:
+                    acc[name][k] += meas[name]; cnt[name][k] += 1.0
+
+            if cfg.store_loschmidt:
+                if psi0_dense is None:
+                    ov_re = ov_im = le = float('nan')
+                else:
+                    vec_t = _state_to_dense(psi)
+                    ov = np.vdot(psi0_dense, vec_t)
+                    ov_re, ov_im, le = float(np.real(ov)), float(np.imag(ov)), float(np.abs(ov)**2)
+                for nm, val in zip(["overlap_re","overlap_im","loschmidt"], [ov_re, ov_im, le]):
+                    if not np.isnan(val):
+                        acc[nm][k] += val; cnt[nm][k] += 1.0
+
+            if cfg.entanglement_cut is not None:
+                Sv = _compute_entropy_at_cut(psi, cfg.entanglement_cut)
+                acc["SvN_cut"][k] += Sv; cnt["SvN_cut"][k] += 1.0
+
+            if do_dense:
+                vec = _state_to_dense(psi)
+                if cfg.store_probabilities:
+                    probs = _measure_probabilities_dense(vec, cfg.store_prob_bases)
+                    for c in prob_cols:
+                        acc[c][k] += probs.get(c, 0.0); cnt[c][k] += 1.0
+                if cfg.measure_pauli_strings:
+                    exps = _measure_pauli_strings_dense(vec, cfg.measure_pauli_strings)
+                    for c in exp_cols:
+                        val = exps.get(c, float('nan'))
+                        if not np.isnan(val):
+                            acc[c][k] += val; cnt[c][k] += 1.0
+
+    # Write outputs
     outdir = cfg.outdir
     _ensure_dir(outdir)
-    run_id = cfg.run_id or f"N{cfg.model.N}_tebd_J{cfg.model.J}_D{cfg.model.Delta}"
     csv_path = os.path.join(outdir, "timeseries.csv")
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(headers)
-        for r in rows:
-            w.writerow(r)
+        for k in range(steps + 1):
+            row = [float(ts[k])]
+            for name in headers[1:]:
+                if name in acc:
+                    denom = cnt[name][k] if cnt[name][k] > 0 else 1.0
+                    row.append(float(acc[name][k] / denom))
+                else:
+                    row.append(float('nan'))
+            w.writerow(row)
 
     manifest = {
-        "run_id": run_id,
+        "run_id": cfg.run_id or f"N{cfg.model.N}_tebd_J{cfg.model.J}_D{cfg.model.Delta}",
         "solver": "tebd2" if cfg.mps.method.upper().startswith("TEBD") else "tdvp",
         "backend": "mps",
         "model": asdict(cfg.model),
@@ -506,25 +544,25 @@ def run(cfg: RunConfig) -> Dict[str, Any]:
         "mps": asdict(cfg.mps) | {"api": "TeNPy"},
         "entanglement_cut": cfg.entanglement_cut,
         "N": cfg.model.N,
-        "notes": "Coupling rescale for Pauli convention: Jxx=4J, Jz=4Δ, hz=2h. SvN in bits. Dense readout only for small N.",
+        "trajectories": {"n_traj": n_traj, "seed": seed},
+        "notes": "Rescale for Pauli convention (Jxx=4J, Jz=4Δ, hz=2h). Open-system via MCWF; H_eff adds i*(γ↓−γ↑)/2 to hz. SvN in bits. Dense readout for small N.",
         "csv": os.path.abspath(csv_path),
         }
     man_path = os.path.join(outdir, "manifest.json")
     with open(man_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    return {"outdir": outdir, "csv": csv_path, "manifest": man_path, "rows": len(rows), "headers": headers}
-
+    return {"outdir": outdir, "csv": csv_path, "manifest": man_path, "rows": steps+1, "headers": headers}
 
 # -------------------------
-# JSON loader
+# Config loader
 # -------------------------
 def load_config(json_path: str) -> RunConfig:
     with open(json_path, "r") as f:
         raw = json.load(f)
 
     if raw.get("backend", "mps") != "mps":
-        raise ValueError('This script is the MPS backend; set "backend": "mps" in your config or use the exact backend.')
+        raise ValueError('This script is the MPS backend; set "backend": "mps".')
 
     model = ModelConfig(
         N=raw["model"]["N"],
@@ -537,7 +575,11 @@ def load_config(json_path: str) -> RunConfig:
     init = InitStateConfig(**raw.get("init", {}))
     time_cfg = TimeConfig(**raw.get("time", {}))
     noise = NoiseConfig(**raw.get("noise", {}))
-    mps_cfg = MPSConfig(**raw.get("mps", {}))
+
+    mps_raw = raw.get("mps", {})
+    traj_raw = mps_raw.get("trajectories", {})
+    mps_cfg = MPSConfig(**{k: v for k, v in mps_raw.items() if k != "trajectories"})
+    mps_cfg.trajectories = TrajectoriesConfig(**traj_raw)
 
     rc = RunConfig(
         backend="mps",
@@ -561,22 +603,20 @@ def load_config(json_path: str) -> RunConfig:
         )
     return rc
 
-
 def main():
-    '''ap = argparse.ArgumentParser(description="MPS/TEBD backend for 1D XX/XXZ chains (TeNPy) + dense readout for small N")
+    ap = argparse.ArgumentParser(description="MPS/TEBD backend (closed & MCWF open) + dense readout")
     ap.add_argument("--config", type=str, required=True, help="Path to JSON config")
     ap.add_argument("--outdir", type=str, default=None, help="Override output directory")
-    args = ap.parse_args()'''
+    args = ap.parse_args()
 
-    rc = load_config("experiments/configs/classical/mps_solution/xx_closed_mps_dense.json")
-    '''rc = load_config(args.config)
+    #rc = load_config("experiments/configs/classical/mps_solution/xx_open_mps_traj.json")
+    rc = load_config(args.config)
     if args.outdir:
-        rc.outdir = args.outdir'''
+        rc.outdir = args.outdir
 
     info = run(rc)
     print("Experiment ran successfully.")
     print(json.dumps(info, indent=2))
-
 
 if __name__ == "__main__":
     main()

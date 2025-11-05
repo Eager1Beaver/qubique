@@ -1,0 +1,62 @@
+{
+  "backend": "mps",
+  "model": {
+    "N": 6,
+    "J": 1.0,
+    "Delta": 0.7,
+    "boundary": "OBC",
+    "disorder": {
+      "kind": "none"
+    },
+    "potential": {
+      "type": "linear",
+      "slope": 0.5
+    }
+  },
+  "init": {
+    "kind": "domain_wall"
+  },
+  "time": {
+    "t_max": 8.0,
+    "steps": 200
+  },
+  "noise": {
+    "dephasing_rate": 0.01,
+    "relaxation_rate": 0.005,
+    "thermal_pop": 0.02
+  },
+  "store_probabilities": true,
+  "store_prob_bases": [
+    "Z",
+    "X",
+    "Y"
+  ],
+  "measure_pauli_strings": [
+    "X0X1X2",
+    "X0Y1Y2",
+    "Y0X1Y2",
+    "Y0Y1X2"
+  ],
+  "entanglement_cut": 3,
+  "store_loschmidt": true,
+  "dense_readout": true,
+  "dense_readout_N_max": 12,
+  "observables": [
+    "energy",
+    "magnetization_z",
+    "sz_sites"
+  ],
+  "mps": {
+    "method": "TEBD2",
+    "bond_dim_max": 384,
+    "svd_trunc_tol": 1e-09,
+    "conserve": "Sz",
+    "two_site": true,
+    "trajectories": {
+      "n_traj": 64,
+      "seed": 45
+    }
+  },
+  "outdir": "experiments/xxz_stark_open_mps",
+  "random_seed": 108
+}
